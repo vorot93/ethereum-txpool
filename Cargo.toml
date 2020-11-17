@@ -1,0 +1,18 @@
+[package]
+name = "ethereum-txpool"
+version = "0.1.0"
+authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
+edition = "2018"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+auto_impl = "0.4"
+ethereum = { git = "https://github.com/rust-blockchain/ethereum", default-features = false }
+ethereum-types = "0.9"
+thiserror = "1"
+rlp = "0.4"
+secp256k1 = { version = "0.19", features = ["global-context", "rand-std", "recovery"] }
+sha3 = "0.9"
+tracing = "0.1"
