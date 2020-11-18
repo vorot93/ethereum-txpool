@@ -28,7 +28,7 @@ struct RichTransaction {
 
 impl RichTransaction {
     fn cost(&self) -> U256 {
-        self.inner.gas_limit * self.inner.gas_price
+        self.inner.gas_limit * self.inner.gas_price + self.inner.value
     }
 }
 
@@ -68,10 +68,22 @@ impl TryFrom<Transaction> for RichTransaction {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BlockHeader {
+    hash: H256,
+    parent: H256,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AccountInfo {
     pub balance: U256,
     pub nonce: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AccountDiff {
+    Changed(AccountInfo),
+    Deleted,
 }
 
 #[async_trait]
@@ -79,16 +91,16 @@ pub struct AccountInfo {
 pub trait AccountInfoProvider: Send + Sync + 'static {
     async fn get_account_info(
         &self,
-        block: u64,
+        block: H256,
         account: Address,
     ) -> anyhow::Result<Option<AccountInfo>>;
 }
 
 #[async_trait]
-impl AccountInfoProvider for HashMap<u64, HashMap<Address, AccountInfo>> {
+impl AccountInfoProvider for HashMap<H256, HashMap<Address, AccountInfo>> {
     async fn get_account_info(
         &self,
-        block: u64,
+        block: H256,
         account: Address,
     ) -> anyhow::Result<Option<AccountInfo>> {
         if let Some(accounts) = self.get(&block) {
@@ -131,14 +143,14 @@ struct AccountPool {
 }
 
 pub struct Pool<DP: AccountInfoProvider> {
-    block: u64,
+    block: BlockHeader,
     data_provider: DP,
     by_hash: HashMap<H256, Arc<RichTransaction>>,
     by_sender: HashMap<Address, AccountPool>,
 }
 
 impl<DP: AccountInfoProvider> Pool<DP> {
-    pub fn new(block: u64, data_provider: DP) -> Self {
+    pub fn new(block: BlockHeader, data_provider: DP) -> Self {
         Self {
             block,
             data_provider,
@@ -158,7 +170,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.by_hash.get(&hash).map(|tx| &tx.inner)
     }
 
-    async fn import_one_rich(&mut self, mut tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
+    async fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
         match self.by_hash.entry(tx.hash) {
             Occupied(_) => {
                 // Tx already there.
@@ -172,7 +184,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                         // This is a new sender, let's get its state.
                         let info = self
                             .data_provider
-                            .get_account_info(self.block, tx.sender)
+                            .get_account_info(self.block.hash, tx.sender)
                             .await
                             .map_err(ImportError::InvalidSender)?
                             .ok_or_else(|| {
@@ -208,7 +220,11 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                                 return Err(ImportError::InsufficientBalance);
                             }
 
-                            std::mem::swap(&mut tx, pooled_tx);
+                            *pooled_tx = tx.clone();
+                        } else {
+                            // Not a replacement transaction.
+                            assert_eq!(tx.inner.nonce, U256::from(account_pool.txs.len()));
+                            account_pool.txs.push_back(tx.clone());
                         }
 
                         let mut dropping = VecDeque::new();
@@ -290,67 +306,44 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.by_sender.clear();
     }
 
-    fn apply_block_inner(&mut self, block: u64, txs: Vec<Transaction>) -> anyhow::Result<()> {
-        if self.block + 1 != block {
+    fn apply_block_inner(
+        &mut self,
+        block: BlockHeader,
+        account_diffs: HashMap<Address, AccountDiff>,
+    ) -> anyhow::Result<()> {
+        if block.parent != self.block.hash {
             bail!(
-                "block gap detected: applying {}, expected {}",
-                block,
-                self.block + 1
+                "block gap detected: applying {} which is not child of {}",
+                block.parent,
+                self.block.hash
             );
         }
 
-        let mut block_txs_by_sender =
-            HashMap::<Address, Option<BTreeMap<u64, RichTransaction>>>::new();
+        for (address, account_diff) in account_diffs {
+            // Only do something if we actually have pool for this sender.
+            if let Occupied(mut address_entry) = self.by_sender.entry(address) {
+                match account_diff {
+                    AccountDiff::Changed(new_info) => {
+                        let pool = address_entry.get_mut();
+                        let nonce_diff = new_info
+                            .nonce
+                            .checked_sub(pool.info.nonce)
+                            .ok_or_else(|| anyhow!("nonce can only move forward!"))?;
 
-        for tx in txs {
-            let tx = RichTransaction::try_from(tx)?;
-            if tx.inner.nonce > U256::from(u64::MAX) {
-                block_txs_by_sender.insert(tx.sender, None);
-            }
-
-            if let Some(m) = block_txs_by_sender
-                .entry(tx.sender)
-                .or_insert_with(|| Some(Default::default()))
-            {
-                m.insert(tx.inner.nonce.as_u64(), tx);
-            }
-        }
-
-        // Now we either cull all confirmed transactions, or drop sender in case of error.
-        for (sender, txs) in block_txs_by_sender {
-            if let Occupied(mut entry) = self.by_sender.entry(sender) {
-                let mut validation_error = false;
-                if let Some(txs) = txs {
-                    let mut pool = entry.get_mut();
-
-                    for (nonce, tx) in txs {
-                        if nonce != pool.info.nonce {
-                            validation_error = true;
-                            break;
+                        for _ in 0..nonce_diff {
+                            if let Some(tx) = pool.txs.pop_front() {
+                                assert!(self.by_hash.remove(&tx.hash).is_some());
+                            }
                         }
 
-                        // Validate that the next tx in pool has the same ID as in block.
-                        if let Some(front_tx) = pool.txs.pop_front() {
-                            assert!(self.by_hash.remove(&tx.hash).is_some());
-                            if front_tx.hash != tx.hash {
-                                validation_error = true;
-                                break;
-                            }
-
-                            pool.info.nonce += 1;
-                        } else {
-                            validation_error = true;
-                            break;
+                        if pool.txs.is_empty() {
+                            address_entry.remove();
                         }
                     }
-                } else {
-                    validation_error = true;
-                }
-
-                if validation_error {
-                    // We will drop all transactions from this sender now
-                    for tx in entry.remove().txs {
-                        assert!(self.by_hash.remove(&tx.hash).is_some());
+                    AccountDiff::Deleted => {
+                        for tx in address_entry.remove().txs {
+                            assert!(self.by_hash.remove(&tx.hash).is_some());
+                        }
                     }
                 }
             }
@@ -359,11 +352,15 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         Ok(())
     }
 
-    pub fn apply_block(&mut self, block: u64, txs: Vec<Transaction>) {
-        if let Err(e) = self.apply_block_inner(block, txs) {
+    pub fn apply_block(
+        &mut self,
+        block: BlockHeader,
+        account_diffs: HashMap<Address, AccountDiff>,
+    ) {
+        if let Err(e) = self.apply_block_inner(block, account_diffs) {
             warn!(
                 "Failed to apply block {}: {}. Resetting transaction pool.",
-                block, e
+                block.hash, e
             );
 
             self.erase();
@@ -371,33 +368,27 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.block = block;
     }
 
-    fn revert_block_inner(&mut self, block: u64, txs: Vec<Transaction>) -> anyhow::Result<()> {
-        if self.block - 1 != block {
+    fn revert_block_inner(
+        &mut self,
+        block: BlockHeader,
+        _reverted_txs: Vec<Transaction>,
+    ) -> anyhow::Result<()> {
+        if self.block.parent != block.hash {
             bail!(
                 "block gap detected: reverting {}, expected {}",
-                block,
-                self.block + 1
+                block.hash,
+                self.block.parent
             );
         }
 
-        // Nothing fancy for now - just drop all senders.
-        for tx in txs {
-            let tx = RichTransaction::try_from(tx)?;
-            if let Some(pool) = self.by_sender.remove(&tx.sender) {
-                for tx in pool.txs {
-                    assert!(self.by_hash.remove(&tx.hash).is_some());
-                }
-            }
-        }
-
-        Ok(())
+        Err(anyhow!("not implemented"))
     }
 
-    pub fn revert_block(&mut self, block: u64, txs: Vec<Transaction>) {
-        if let Err(e) = self.revert_block_inner(block, txs) {
+    pub fn revert_block(&mut self, block: BlockHeader, reverted_txs: Vec<Transaction>) {
+        if let Err(e) = self.revert_block_inner(block, reverted_txs) {
             warn!(
                 "Failed to revert block {}: {}. Resetting transaction pool.",
-                block, e
+                block.hash, e
             );
 
             self.erase();
