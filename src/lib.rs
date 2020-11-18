@@ -119,6 +119,12 @@ pub enum ImportError {
     Other(anyhow::Error),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Status {
+    pub transactions: usize,
+    pub senders: usize,
+}
+
 struct AccountPool {
     nonce_offset: u64,
     balance: U256,
@@ -144,6 +150,13 @@ impl<DP> Pool<DP> {
 }
 
 impl<DP: AccountInfoProvider> Pool<DP> {
+    pub fn status(&self) -> Status {
+        Status {
+            transactions: self.by_hash.len(),
+            senders: self.by_sender.len(),
+        }
+    }
+
     pub fn get(&self, hash: H256) -> Option<&Transaction> {
         self.by_hash.get(&hash).map(|tx| &tx.inner)
     }
