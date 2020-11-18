@@ -131,14 +131,14 @@ struct AccountPool {
     txs: VecDeque<Arc<RichTransaction>>,
 }
 
-pub struct Pool<DP> {
+pub struct Pool<DP: AccountInfoProvider> {
     block: u64,
     data_provider: DP,
     by_hash: HashMap<H256, Arc<RichTransaction>>,
     by_sender: HashMap<Address, AccountPool>,
 }
 
-impl<DP> Pool<DP> {
+impl<DP: AccountInfoProvider> Pool<DP> {
     pub fn new(block: u64, data_provider: DP) -> Self {
         Self {
             block,
@@ -147,9 +147,7 @@ impl<DP> Pool<DP> {
             by_sender: Default::default(),
         }
     }
-}
 
-impl<DP: AccountInfoProvider> Pool<DP> {
     pub fn status(&self) -> Status {
         Status {
             transactions: self.by_hash.len(),
