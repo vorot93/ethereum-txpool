@@ -408,6 +408,15 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     pub fn pending_transactions(&self) -> impl Iterator<Item = &Transaction> {
         self.by_hash.values().map(|tx| &tx.inner)
     }
+
+    pub fn pending_transactions_for_sender(
+        &self,
+        sender: Address,
+    ) -> Option<impl Iterator<Item = &Transaction>> {
+        self.by_sender
+            .get(&sender)
+            .map(|pool| pool.txs.iter().map(|tx| &tx.inner))
+    }
 }
 
 #[cfg(test)]
