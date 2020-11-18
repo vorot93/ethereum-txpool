@@ -404,6 +404,10 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         }
         self.block = block;
     }
+
+    pub fn pending_transactions(&self) -> impl Iterator<Item = &Transaction> {
+        self.by_hash.values().map(|tx| &tx.inner)
+    }
 }
 
 #[cfg(test)]
