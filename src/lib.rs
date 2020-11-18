@@ -375,3 +375,26 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.block = block;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex_literal::hex;
+
+    #[test]
+    fn test_parse_transaction() {
+        let raw = hex!("f86e821d82850525dbd38082520894ce96e38eeff1c972f8f2851a7275b79b13b9a0498805e148839955f4008025a0ab1d3780cf338d1f86f42181ed13cd6c7fee7911a942c7583d36c9c83f5ec419a04984933928fac4b3242b9184aed633cc848f6a11d42af743f262ccf6592b8f71");
+
+        let res = RichTransaction::try_from(rlp::decode::<Transaction>(&raw).unwrap()).unwrap();
+
+        assert_eq!(
+            &hex::encode(res.hash.0),
+            "560ab39fe63d8fbbf688f0ebb6cfcacee4ce2ae8d85b096aa04c22a7c4c438af"
+        );
+
+        assert_eq!(
+            &hex::encode(res.sender.as_bytes()),
+            "3123c4396f1306678f382c186aee2dccce44f72c"
+        );
+    }
+}
