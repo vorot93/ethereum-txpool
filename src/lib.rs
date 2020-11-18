@@ -144,6 +144,10 @@ impl<DP> Pool<DP> {
 }
 
 impl<DP: AccountInfoProvider> Pool<DP> {
+    pub fn get(&self, hash: H256) -> Option<&Transaction> {
+        self.by_hash.get(&hash).map(|tx| &tx.inner)
+    }
+
     pub async fn import(&mut self, tx: Transaction) -> Result<bool, ImportError> {
         let mut tx =
             Arc::new(RichTransaction::try_from(tx).map_err(ImportError::InvalidTransaction)?);
