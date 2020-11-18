@@ -126,8 +126,7 @@ pub struct Status {
 }
 
 struct AccountPool {
-    nonce_offset: u64,
-    balance: U256,
+    info: AccountInfo,
     txs: VecDeque<Arc<RichTransaction>>,
 }
 
@@ -159,14 +158,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.by_hash.get(&hash).map(|tx| &tx.inner)
     }
 
-    pub async fn import(&mut self, tx: Transaction) -> Result<bool, ImportError> {
-        let mut tx =
-            Arc::new(RichTransaction::try_from(tx).map_err(ImportError::InvalidTransaction)?);
-
-        if tx.inner.nonce > U256::from(u64::MAX) {
-            return Err(ImportError::InvalidTransaction(anyhow!("nonce too large")));
-        }
-
+    async fn import_one_rich(&mut self, mut tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
         match self.by_hash.entry(tx.hash) {
             Occupied(_) => {
                 // Tx already there.
@@ -188,19 +180,13 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                             })?;
 
                         entry.insert(AccountPool {
-                            nonce_offset: info.nonce,
-                            balance: info.balance,
+                            info,
                             txs: Default::default(),
                         })
                     }
                 };
 
-                if let Some(offset) = tx
-                    .inner
-                    .nonce
-                    .as_u64()
-                    .checked_sub(account_pool.nonce_offset)
-                {
+                if let Some(offset) = tx.inner.nonce.as_u64().checked_sub(account_pool.info.nonce) {
                     // This transaction's nonce is account nonce or greater.
                     if offset <= account_pool.txs.len() as u64 {
                         // This transaction is between existing txs in the pool, or right the next one.
@@ -210,7 +196,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                             .txs
                             .iter()
                             .take(offset as usize)
-                            .fold(account_pool.balance, |balance, tx| balance - tx.cost());
+                            .fold(account_pool.info.balance, |balance, tx| balance - tx.cost());
 
                         // If this is a replacement transaction, pick between this and old.
                         if let Some(pooled_tx) = account_pool.txs.get_mut(offset as usize) {
@@ -255,6 +241,50 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         }
     }
 
+    pub async fn import_one(&mut self, tx: Transaction) -> Result<bool, ImportError> {
+        let tx = Arc::new(RichTransaction::try_from(tx).map_err(ImportError::InvalidTransaction)?);
+
+        self.import_one_rich(tx).await
+    }
+
+    pub async fn import_many(&mut self, txs: Vec<Transaction>) -> usize {
+        let txs = txs
+            .into_iter()
+            .filter_map(|v| RichTransaction::try_from(v).ok())
+            .fold(
+                HashMap::<Address, BTreeMap<U256, RichTransaction>>::new(),
+                |mut txs, mut tx| {
+                    match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(tx);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let mut entry = entry.get_mut();
+
+                            if tx.inner.gas_price > entry.inner.gas_price {
+                                std::mem::swap(&mut tx, &mut entry);
+                            }
+                        }
+                    };
+                    txs
+                },
+            );
+
+        let mut total = 0;
+        for (_, account_txs) in txs {
+            for (_, tx) in account_txs {
+                if self.import_one_rich(Arc::new(tx)).await.is_ok() {
+                    total += 1
+                } else {
+                    // If we drop one account tx, then the remaining are invalid because of nonce gap.
+                    break;
+                }
+            }
+        }
+
+        total
+    }
+
     pub fn erase(&mut self) {
         self.by_hash.clear();
         self.by_sender.clear();
@@ -294,7 +324,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                     let mut pool = entry.get_mut();
 
                     for (nonce, tx) in txs {
-                        if nonce != pool.nonce_offset {
+                        if nonce != pool.info.nonce {
                             validation_error = true;
                             break;
                         }
@@ -307,7 +337,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                                 break;
                             }
 
-                            pool.nonce_offset += 1;
+                            pool.info.nonce += 1;
                         } else {
                             validation_error = true;
                             break;
