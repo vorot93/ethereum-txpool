@@ -1,3 +1,5 @@
+//! Transaction pool for Ethereum.
+
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use auto_impl::auto_impl;
@@ -80,15 +82,18 @@ pub struct AccountInfo {
     pub nonce: u64,
 }
 
+/// Account diff
 #[derive(Clone, Copy, Debug)]
 pub enum AccountDiff {
     Changed(AccountInfo),
     Deleted,
 }
 
+/// The necessary glue to get Ethereum state. See `Pool` docs for more info.
 #[async_trait]
 #[auto_impl(&, Box, Arc)]
 pub trait AccountInfoProvider: Send + Sync + 'static {
+    /// Get account information at specified block.
     async fn get_account_info(
         &self,
         block: H256,
@@ -142,6 +147,13 @@ struct AccountPool {
     txs: VecDeque<Arc<RichTransaction>>,
 }
 
+/// Transaction pool that is able to import Ethereum transactions, check their validity and provide traversal over all of them.
+///
+/// Unlike most pool implementations, this `Pool` does not support and guards against nonce gaps.
+/// As a consequence, we can sort transactions by sender and store in double ended queue, where `tx_nonce = account_nonce + queue_pos`.
+/// This makes traversal efficient.
+///
+/// `Pool` **must** be used together with a client: validity checks require knowledge about account nonce and balance.
 pub struct Pool<DP: AccountInfoProvider> {
     block: BlockHeader,
     data_provider: DP,
@@ -150,6 +162,7 @@ pub struct Pool<DP: AccountInfoProvider> {
 }
 
 impl<DP: AccountInfoProvider> Pool<DP> {
+    /// Create a new instance of `Pool`.
     pub fn new(block: BlockHeader, data_provider: DP) -> Self {
         Self {
             block,
@@ -159,6 +172,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         }
     }
 
+    /// Get status of this pool.
     pub fn status(&self) -> Status {
         Status {
             transactions: self.by_hash.len(),
@@ -166,6 +180,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         }
     }
 
+    /// Get transaction by its hash.
     pub fn get(&self, hash: H256) -> Option<&Transaction> {
         self.by_hash.get(&hash).map(|tx| &tx.inner)
     }
@@ -257,12 +272,14 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         }
     }
 
+    /// Import one transaction.
     pub async fn import_one(&mut self, tx: Transaction) -> Result<bool, ImportError> {
         let tx = Arc::new(RichTransaction::try_from(tx).map_err(ImportError::InvalidTransaction)?);
 
         self.import_one_rich(tx).await
     }
 
+    /// Import several transactions.
     pub async fn import_many(&mut self, txs: Vec<Transaction>) -> usize {
         let txs = txs
             .into_iter()
@@ -301,6 +318,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         total
     }
 
+    /// Erase all transactions from the pool.
     pub fn erase(&mut self) {
         self.by_hash.clear();
         self.by_sender.clear();
@@ -352,6 +370,8 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         Ok(())
     }
 
+    /// Apply state updates from new confirmed block.
+    /// This should be called by the client when it confirms new block.
     pub fn apply_block(
         &mut self,
         block: BlockHeader,
@@ -384,6 +404,8 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         Err(anyhow!("not implemented"))
     }
 
+    /// Revert state updates from block that has become non-canonical, restore its transactions to the pool.
+    /// This should be called by the client when it encounters a reorg.
     pub fn revert_block(&mut self, block: BlockHeader, reverted_txs: Vec<Transaction>) {
         if let Err(e) = self.revert_block_inner(block, reverted_txs) {
             warn!(
@@ -396,10 +418,12 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.block = block;
     }
 
+    /// Produce an iterator over all pending transactions in random order.
     pub fn pending_transactions(&self) -> impl Iterator<Item = &Transaction> {
         self.by_hash.values().map(|tx| &tx.inner)
     }
 
+    /// Produce an iterator for pending transactions from `sender`, sorted by nonce in ascending order.
     pub fn pending_transactions_for_sender(
         &self,
         sender: Address,
