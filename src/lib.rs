@@ -132,6 +132,8 @@ pub enum ImportError {
     FeeTooLow,
     #[error("not enough balance to pay for gas")]
     InsufficientBalance,
+    #[error("current block has not been set")]
+    NoCurrentBlock,
     #[error("other: {0}")]
     Other(anyhow::Error),
 }
@@ -174,7 +176,7 @@ impl AccountPool {
 ///
 /// `Pool` **must** be used together with a client: validity checks require knowledge about account nonce and balance.
 pub struct Pool<DP: AccountInfoProvider> {
-    block: BlockHeader,
+    block: Option<BlockHeader>,
     data_provider: DP,
     by_hash: HashMap<H256, Arc<RichTransaction>>,
     by_sender: HashMap<Address, AccountPool>,
@@ -182,10 +184,10 @@ pub struct Pool<DP: AccountInfoProvider> {
 
 impl<DP: AccountInfoProvider> Pool<DP> {
     /// Create a new instance of `Pool`.
-    pub fn new(block: BlockHeader, data_provider: DP) -> Self {
+    pub fn new(data_provider: DP) -> Self {
         Self {
-            block,
             data_provider,
+            block: None,
             by_hash: Default::default(),
             by_sender: Default::default(),
         }
@@ -205,6 +207,8 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     }
 
     async fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
+        let block = self.block.ok_or_else(|| ImportError::NoCurrentBlock)?;
+
         match self.by_hash.entry(tx.hash) {
             Occupied(_) => {
                 // Tx already there.
@@ -218,7 +222,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                         // This is a new sender, let's get its state.
                         let info = self
                             .data_provider
-                            .get_account_info(self.block.hash, tx.sender)
+                            .get_account_info(block.hash, tx.sender)
                             .await
                             .map_err(ImportError::InvalidSender)?
                             .ok_or_else(|| {
@@ -354,11 +358,17 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         block: BlockHeader,
         account_diffs: HashMap<Address, AccountDiff>,
     ) -> anyhow::Result<()> {
-        if block.parent != self.block.hash {
+        let current_block = if let Some(b) = self.block {
+            b
+        } else {
+            return Ok(());
+        };
+
+        if block.parent != current_block.hash {
             bail!(
                 "block gap detected: attemped to apply {} which is not child of {}",
                 block.parent,
-                self.block.hash
+                current_block.hash
             );
         }
 
@@ -415,7 +425,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
 
             self.erase();
         }
-        self.block = block;
+        self.block = Some(block);
     }
 
     fn revert_block_inner(
@@ -423,11 +433,17 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         block: BlockHeader,
         _reverted_txs: Vec<Transaction>,
     ) -> anyhow::Result<()> {
-        if self.block.parent != block.hash {
+        let current_block = if let Some(b) = self.block {
+            b
+        } else {
+            return Ok(());
+        };
+
+        if current_block.parent != block.hash {
             bail!(
                 "block gap detected: attempted to revert to {}, expected {}",
                 block.hash,
-                self.block.parent
+                current_block.parent
             );
         }
 
@@ -445,7 +461,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
 
             self.erase();
         }
-        self.block = block;
+        self.block = Some(block);
     }
 
     /// Produce an iterator over all pending transactions in random order.
