@@ -298,29 +298,26 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     /// Import several transactions.
     pub async fn import_many(
         &mut self,
-        txs: Vec<Transaction>,
+        txs: impl Iterator<Item = Transaction>,
     ) -> HashMap<H256, Result<bool, ImportError>> {
-        let txs = txs
-            .into_iter()
-            .filter_map(|v| RichTransaction::try_from(v).ok())
-            .fold(
-                HashMap::<Address, BTreeMap<U256, RichTransaction>>::new(),
-                |mut txs, mut tx| {
-                    match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(tx);
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let mut entry = entry.get_mut();
+        let txs = txs.filter_map(|v| RichTransaction::try_from(v).ok()).fold(
+            HashMap::<Address, BTreeMap<U256, RichTransaction>>::new(),
+            |mut txs, mut tx| {
+                match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(tx);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let mut entry = entry.get_mut();
 
-                            if tx.inner.gas_price > entry.inner.gas_price {
-                                std::mem::swap(&mut tx, &mut entry);
-                            }
+                        if tx.inner.gas_price > entry.inner.gas_price {
+                            std::mem::swap(&mut tx, &mut entry);
                         }
-                    };
-                    txs
-                },
-            );
+                    }
+                };
+                txs
+            },
+        );
 
         let mut total = HashMap::with_capacity(txs.len());
         for (_, account_txs) in txs {
