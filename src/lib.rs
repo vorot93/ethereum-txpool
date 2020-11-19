@@ -147,6 +147,25 @@ struct AccountPool {
     txs: VecDeque<Arc<RichTransaction>>,
 }
 
+impl AccountPool {
+    fn prune_insufficient_balance(
+        &mut self,
+        cache: Option<(usize, U256)>,
+    ) -> VecDeque<Arc<RichTransaction>> {
+        let (offset, mut cumulative_balance) = cache.unwrap_or((0, self.info.balance));
+
+        for (i, tx) in self.txs.iter().enumerate().skip(offset as usize) {
+            if let Some(balance) = cumulative_balance.checked_sub(tx.cost()) {
+                cumulative_balance = balance;
+            } else {
+                return self.txs.split_off(i);
+            }
+        }
+
+        VecDeque::new()
+    }
+}
+
 /// Transaction pool that is able to import Ethereum transactions, check their validity and provide traversal over all of them.
 ///
 /// Unlike most pool implementations, this `Pool` does not support and guards against nonce gaps.
@@ -219,7 +238,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                         // This transaction is between existing txs in the pool, or right the next one.
 
                         // Compute balance after executing all txs before it.
-                        let mut cumulative_balance = account_pool
+                        let cumulative_balance = account_pool
                             .txs
                             .iter()
                             .take(offset as usize)
@@ -235,29 +254,22 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                                 return Err(ImportError::InsufficientBalance);
                             }
 
-                            *pooled_tx = tx.clone();
+                            tx_by_hash_entry.insert(tx.clone());
+                            assert!(self.by_hash.remove(&pooled_tx.hash).is_some());
+                            *pooled_tx = tx;
                         } else {
                             // Not a replacement transaction.
                             assert_eq!(tx.inner.nonce, U256::from(account_pool.txs.len()));
-                            account_pool.txs.push_back(tx.clone());
-                        }
 
-                        let mut dropping = VecDeque::new();
+                            tx_by_hash_entry.insert(tx.clone());
+                            account_pool.txs.push_back(tx);
+                        }
 
                         // Compute the balance after executing remaining transactions. Select for removal those for which we do not have enough balance.
-                        for (i, tx) in account_pool.txs.iter().enumerate().skip(offset as usize) {
-                            if let Some(balance) = cumulative_balance.checked_sub(tx.cost()) {
-                                cumulative_balance = balance;
-                            } else {
-                                dropping = account_pool.txs.split_off(i);
-                                break;
-                            }
-                        }
-
-                        tx_by_hash_entry.insert(tx);
-
-                        for item in dropping {
-                            self.by_hash.remove(&item.hash);
+                        for tx in account_pool
+                            .prune_insufficient_balance(Some((offset as usize, cumulative_balance)))
+                        {
+                            assert!(self.by_hash.remove(&tx.hash).is_some());
                         }
 
                         Ok(true)
@@ -280,7 +292,10 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     }
 
     /// Import several transactions.
-    pub async fn import_many(&mut self, txs: Vec<Transaction>) -> usize {
+    pub async fn import_many(
+        &mut self,
+        txs: Vec<Transaction>,
+    ) -> HashMap<H256, Result<bool, ImportError>> {
         let txs = txs
             .into_iter()
             .filter_map(|v| RichTransaction::try_from(v).ok())
@@ -303,15 +318,25 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                 },
             );
 
-        let mut total = 0;
+        let mut total = HashMap::with_capacity(txs.len());
         for (_, account_txs) in txs {
+            let mut chain_error = false;
             for (_, tx) in account_txs {
-                if self.import_one_rich(Arc::new(tx)).await.is_ok() {
-                    total += 1
-                } else {
-                    // If we drop one account tx, then the remaining are invalid because of nonce gap.
-                    break;
-                }
+                total.insert(
+                    tx.hash,
+                    if chain_error {
+                        Err(ImportError::NonceGap)
+                    } else {
+                        let res = self.import_one_rich(Arc::new(tx)).await;
+
+                        if res.is_err() {
+                            // If we drop one account tx, then the remaining are invalid because of nonce gap.
+                            chain_error = true;
+                        }
+
+                        res
+                    },
+                );
             }
         }
 
@@ -331,7 +356,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     ) -> anyhow::Result<()> {
         if block.parent != self.block.hash {
             bail!(
-                "block gap detected: applying {} which is not child of {}",
+                "block gap detected: attemped to apply {} which is not child of {}",
                 block.parent,
                 self.block.hash
             );
@@ -352,6 +377,11 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                             if let Some(tx) = pool.txs.pop_front() {
                                 assert!(self.by_hash.remove(&tx.hash).is_some());
                             }
+                        }
+
+                        // More expensive tx could have squeezed in - we have to recheck our balance.
+                        for tx in pool.prune_insufficient_balance(None) {
+                            assert!(self.by_hash.remove(&tx.hash).is_some());
                         }
 
                         if pool.txs.is_empty() {
@@ -395,7 +425,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     ) -> anyhow::Result<()> {
         if self.block.parent != block.hash {
             bail!(
-                "block gap detected: reverting {}, expected {}",
+                "block gap detected: attempted to revert to {}, expected {}",
                 block.hash,
                 self.block.parent
             );
