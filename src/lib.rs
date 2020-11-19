@@ -299,32 +299,44 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     pub async fn import_many(
         &mut self,
         txs: impl Iterator<Item = Transaction>,
-    ) -> HashMap<H256, Result<bool, ImportError>> {
-        let txs = txs.filter_map(|v| RichTransaction::try_from(v).ok()).fold(
-            HashMap::<Address, BTreeMap<U256, RichTransaction>>::new(),
-            |mut txs, mut tx| {
-                match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(tx);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let mut entry = entry.get_mut();
+    ) -> Vec<Result<bool, ImportError>> {
+        let mut out = vec![];
 
-                        if tx.inner.gas_price > entry.inner.gas_price {
-                            std::mem::swap(&mut tx, &mut entry);
-                        }
+        let txs = txs.enumerate().fold(
+            HashMap::<Address, BTreeMap<U256, (usize, RichTransaction)>>::new(),
+            |mut txs, (idx, tx)| {
+                out.push(Ok(false));
+                match RichTransaction::try_from(tx) {
+                    Err(e) => {
+                        out[idx] = Err(ImportError::InvalidTransaction(e));
+                        txs
                     }
-                };
-                txs
+                    Ok(tx) => {
+                        match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert((idx, tx));
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                let (old_idx, old_tx) = entry.get();
+
+                                if tx.inner.gas_price > old_tx.inner.gas_price {
+                                    out[*old_idx] = Err(ImportError::FeeTooLow);
+                                    *entry.get_mut() = (idx, tx);
+                                } else {
+                                    out[idx] = Err(ImportError::FeeTooLow);
+                                }
+                            }
+                        };
+                        txs
+                    }
+                }
             },
         );
 
-        let mut total = HashMap::with_capacity(txs.len());
         for (_, account_txs) in txs {
             let mut chain_error = false;
-            for (_, tx) in account_txs {
-                total.insert(
-                    tx.hash,
+            for (_, (idx, tx)) in account_txs {
+                out[idx] = {
                     if chain_error {
                         Err(ImportError::NonceGap)
                     } else {
@@ -336,12 +348,12 @@ impl<DP: AccountInfoProvider> Pool<DP> {
                         }
 
                         res
-                    },
-                );
+                    }
+                };
             }
         }
 
-        total
+        out
     }
 
     /// Erase all transactions from the pool.
