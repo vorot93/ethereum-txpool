@@ -199,14 +199,14 @@ impl Pool {
                             .take(offset as usize)
                             .fold(account_pool.info.balance, |balance, tx| balance - tx.cost());
 
+                        if cumulative_balance.checked_sub(tx.cost()).is_none() {
+                            return Err(ImportError::InsufficientBalance);
+                        }
+
                         // If this is a replacement transaction, pick between this and old.
                         if let Some(pooled_tx) = account_pool.txs.get_mut(offset as usize) {
                             if pooled_tx.inner.gas_price >= tx.inner.gas_price {
                                 return Err(ImportError::FeeTooLow);
-                            }
-
-                            if cumulative_balance.checked_sub(tx.cost()).is_none() {
-                                return Err(ImportError::InsufficientBalance);
                             }
 
                             tx_by_hash_entry.insert(tx.clone());
