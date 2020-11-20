@@ -350,6 +350,18 @@ impl Pool {
         false
     }
 
+    /// Drop account from this pool.
+    pub fn drop_account(&mut self, address: Address) -> bool {
+        if let Some(pool) = self.by_sender.remove(&address) {
+            for tx in pool.txs {
+                assert!(self.by_hash.remove(&tx.hash).is_some());
+            }
+            return true;
+        }
+
+        false
+    }
+
     /// Get account state in this pool.
     pub fn account_state(&self, address: Address) -> Option<AccountInfo> {
         self.by_sender.get(&address).map(|pool| pool.info)
