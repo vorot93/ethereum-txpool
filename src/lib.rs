@@ -349,6 +349,11 @@ impl Pool {
         false
     }
 
+    /// Get account state in this pool.
+    pub fn account_state(&self, address: Address) -> Option<AccountInfo> {
+        self.by_sender.get(&address).map(|pool| pool.info)
+    }
+
     fn apply_block_inner(
         &mut self,
         block: BlockHeader,
