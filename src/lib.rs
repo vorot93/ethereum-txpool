@@ -1,8 +1,6 @@
 //! Transaction pool for Ethereum.
 
 use anyhow::{anyhow, bail};
-use async_trait::async_trait;
-use auto_impl::auto_impl;
 use ethereum::Transaction;
 use ethereum_types::{Address, H256, U256};
 use rlp::{Encodable, RlpStream};
@@ -89,37 +87,10 @@ pub enum AccountDiff {
     Deleted,
 }
 
-/// The necessary glue to get Ethereum state. See [Pool] docs for more info.
-#[async_trait]
-#[auto_impl(&, Box, Arc)]
-pub trait AccountInfoProvider: Send + Sync + 'static {
-    /// Get account information at specified block.
-    async fn get_account_info(
-        &self,
-        block: H256,
-        account: Address,
-    ) -> anyhow::Result<Option<AccountInfo>>;
-}
-
-#[async_trait]
-impl AccountInfoProvider for HashMap<H256, HashMap<Address, AccountInfo>> {
-    async fn get_account_info(
-        &self,
-        block: H256,
-        account: Address,
-    ) -> anyhow::Result<Option<AccountInfo>> {
-        if let Some(accounts) = self.get(&block) {
-            if let Some(info) = accounts.get(&account) {
-                return Ok(Some(*info));
-            }
-        }
-
-        Ok(None)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ImportError {
+    #[error("need state for account: {0}")]
+    NoState(Address),
     #[error("invalid transaction: {0}")]
     InvalidTransaction(anyhow::Error),
     #[error("nonce gap")]
@@ -175,22 +146,17 @@ impl AccountPool {
 /// This makes traversal efficient.
 ///
 /// [Pool] **must** be used together with a client: validity checks require knowledge about account nonce and balance.
-pub struct Pool<DP: AccountInfoProvider> {
+#[derive(Default)]
+pub struct Pool {
     block: Option<BlockHeader>,
-    data_provider: DP,
     by_hash: HashMap<H256, Arc<RichTransaction>>,
     by_sender: HashMap<Address, AccountPool>,
 }
 
-impl<DP: AccountInfoProvider> Pool<DP> {
+impl Pool {
     /// Create a new pool instance.
-    pub fn new(data_provider: DP) -> Self {
-        Self {
-            data_provider,
-            block: None,
-            by_hash: Default::default(),
-            by_sender: Default::default(),
-        }
+    pub fn new() -> Self {
+        Default::default()
     }
 
     /// Get status of this pool.
@@ -206,8 +172,8 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         self.by_hash.get(&hash).map(|tx| &tx.inner)
     }
 
-    async fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
-        let block = self.block.ok_or(ImportError::NoCurrentBlock)?;
+    fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
+        self.block.ok_or(ImportError::NoCurrentBlock)?;
 
         match self.by_hash.entry(tx.hash) {
             Occupied(_) => {
@@ -216,25 +182,10 @@ impl<DP: AccountInfoProvider> Pool<DP> {
             }
             Vacant(tx_by_hash_entry) => {
                 // This is a new transaction.
-                let account_pool = match self.by_sender.entry(tx.sender) {
-                    Occupied(occupied) => occupied.into_mut(),
-                    Vacant(entry) => {
-                        // This is a new sender, let's get its state.
-                        let info = self
-                            .data_provider
-                            .get_account_info(block.hash, tx.sender)
-                            .await
-                            .map_err(ImportError::InvalidSender)?
-                            .ok_or_else(|| {
-                                ImportError::InvalidSender(anyhow!("sender account does not exist"))
-                            })?;
-
-                        entry.insert(AccountPool {
-                            info,
-                            txs: Default::default(),
-                        })
-                    }
-                };
+                let account_pool = self
+                    .by_sender
+                    .get_mut(&tx.sender)
+                    .ok_or(ImportError::NoState(tx.sender))?;
 
                 if let Some(offset) = tx.inner.nonce.as_u64().checked_sub(account_pool.info.nonce) {
                     // This transaction's nonce is account nonce or greater.
@@ -289,14 +240,14 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     }
 
     /// Import one transaction.
-    pub async fn import_one(&mut self, tx: Transaction) -> Result<bool, ImportError> {
+    pub fn import_one(&mut self, tx: Transaction) -> Result<bool, ImportError> {
         let tx = Arc::new(RichTransaction::try_from(tx).map_err(ImportError::InvalidTransaction)?);
 
-        self.import_one_rich(tx).await
+        self.import_one_rich(tx)
     }
 
     /// Import several transactions.
-    pub async fn import_many(
+    pub fn import_many(
         &mut self,
         txs: impl Iterator<Item = Transaction>,
     ) -> Vec<Result<bool, ImportError>> {
@@ -335,16 +286,27 @@ impl<DP: AccountInfoProvider> Pool<DP> {
 
         for (_, account_txs) in txs {
             let mut chain_error = false;
+            let mut no_state = None;
             for (_, (idx, tx)) in account_txs {
                 out[idx] = {
                     if chain_error {
-                        Err(ImportError::NonceGap)
+                        Err({
+                            if let Some(address) = no_state {
+                                ImportError::NoState(address)
+                            } else {
+                                ImportError::NonceGap
+                            }
+                        })
                     } else {
-                        let res = self.import_one_rich(Arc::new(tx)).await;
+                        let res = self.import_one_rich(Arc::new(tx));
 
-                        if res.is_err() {
+                        if let Err(e) = &res {
                             // If we drop one account tx, then the remaining are invalid because of nonce gap.
                             chain_error = true;
+
+                            if let ImportError::NoState(address) = e {
+                                no_state = Some(*address);
+                            }
                         }
 
                         res
@@ -356,10 +318,35 @@ impl<DP: AccountInfoProvider> Pool<DP> {
         out
     }
 
+    /// Get current block this pool is at.
+    pub fn current_block(&self) -> Option<BlockHeader> {
+        self.block
+    }
+
     /// Erase all transactions from the pool.
     pub fn erase(&mut self) {
         self.by_hash.clear();
         self.by_sender.clear();
+    }
+
+    /// Reset transaction pool to this block.
+    pub fn reset(&mut self, block: Option<BlockHeader>) {
+        self.erase();
+        self.block = block;
+    }
+
+    /// Add state of the account to this pool.
+    pub fn add_account_state(&mut self, address: Address, info: AccountInfo) -> bool {
+        if let Vacant(entry) = self.by_sender.entry(address) {
+            entry.insert(AccountPool {
+                info,
+                txs: Default::default(),
+            });
+
+            return true;
+        }
+
+        false
     }
 
     fn apply_block_inner(
