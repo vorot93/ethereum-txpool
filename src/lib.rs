@@ -89,7 +89,7 @@ pub enum AccountDiff {
     Deleted,
 }
 
-/// The necessary glue to get Ethereum state. See `Pool` docs for more info.
+/// The necessary glue to get Ethereum state. See [Pool] docs for more info.
 #[async_trait]
 #[auto_impl(&, Box, Arc)]
 pub trait AccountInfoProvider: Send + Sync + 'static {
@@ -170,11 +170,11 @@ impl AccountPool {
 
 /// Transaction pool that is able to import Ethereum transactions, check their validity and provide traversal over all of them.
 ///
-/// Unlike most pool implementations, this `Pool` does not support and guards against nonce gaps.
+/// Unlike most pool implementations, [Pool] does not support and guards against nonce gaps.
 /// As a consequence, we can sort transactions by sender and store in double ended queue, where `tx_nonce = account_nonce + queue_pos`.
 /// This makes traversal efficient.
 ///
-/// `Pool` **must** be used together with a client: validity checks require knowledge about account nonce and balance.
+/// [Pool] **must** be used together with a client: validity checks require knowledge about account nonce and balance.
 pub struct Pool<DP: AccountInfoProvider> {
     block: Option<BlockHeader>,
     data_provider: DP,
@@ -183,7 +183,7 @@ pub struct Pool<DP: AccountInfoProvider> {
 }
 
 impl<DP: AccountInfoProvider> Pool<DP> {
-    /// Create a new instance of `Pool`.
+    /// Create a new pool instance.
     pub fn new(data_provider: DP) -> Self {
         Self {
             data_provider,
@@ -207,7 +207,7 @@ impl<DP: AccountInfoProvider> Pool<DP> {
     }
 
     async fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
-        let block = self.block.ok_or_else(|| ImportError::NoCurrentBlock)?;
+        let block = self.block.ok_or(ImportError::NoCurrentBlock)?;
 
         match self.by_hash.entry(tx.hash) {
             Occupied(_) => {
