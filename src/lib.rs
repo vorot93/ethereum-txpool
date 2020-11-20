@@ -6,7 +6,7 @@ use ethereum_types::{Address, H256, U256};
 use rlp::{Encodable, RlpStream};
 use secp256k1::{
     recovery::{RecoverableSignature, RecoveryId},
-    Message, SECP256K1,
+    Message, PublicKey, SECP256K1,
 };
 use sha3::{Digest, Keccak256};
 use std::{
@@ -32,6 +32,10 @@ impl RichTransaction {
     }
 }
 
+fn pk2addr(pk: &PublicKey) -> Address {
+    Address::from_slice(&Keccak256::digest(&pk.serialize_uncompressed()[1..])[12..])
+}
+
 impl TryFrom<Transaction> for RichTransaction {
     type Error = anyhow::Error;
 
@@ -48,20 +52,17 @@ impl TryFrom<Transaction> for RichTransaction {
         sig[32..].copy_from_slice(tx.signature.s().as_bytes());
         let rec = RecoveryId::from_i32(tx.signature.standard_v() as i32).unwrap();
 
-        let public = &SECP256K1
-            .recover(
-                &Message::from_slice(
-                    ethereum::TransactionMessage::from(tx.clone())
-                        .hash()
-                        .as_bytes(),
-                )?,
-                &RecoverableSignature::from_compact(&sig, rec)?,
-            )?
-            .serialize_uncompressed()[1..];
+        let public = &SECP256K1.recover(
+            &Message::from_slice(
+                ethereum::TransactionMessage::from(tx.clone())
+                    .hash()
+                    .as_bytes(),
+            )?,
+            &RecoverableSignature::from_compact(&sig, rec)?,
+        )?;
 
-        let sender = Address::from_slice(&Keccak256::digest(&public)[12..]);
         Ok(Self {
-            sender,
+            sender: pk2addr(public),
             hash,
             inner: tx,
         })
@@ -484,10 +485,137 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethereum::{TransactionAction, TransactionMessage, TransactionSignature};
     use hex_literal::hex;
+    use maplit::hashmap;
+    use secp256k1::SecretKey;
+    use std::iter::repeat_with;
+
+    const CHAIN_ID: u64 = 1;
+
+    const B_0: BlockHeader = BlockHeader {
+        parent: H256(hex!(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+        )),
+        hash: H256(hex!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )),
+    };
+
+    fn cost(tx: &TransactionMessage) -> U256 {
+        tx.gas_limit * tx.gas_price + tx.value
+    }
+
+    fn sign_tx(secret_key: &SecretKey, transaction_message: TransactionMessage) -> Transaction {
+        let (rec, sig) = SECP256K1
+            .sign_recoverable(
+                &Message::from_slice(transaction_message.hash().as_bytes()).unwrap(),
+                &secret_key,
+            )
+            .serialize_compact();
+
+        let mut v = rec.to_i32() as u64;
+
+        v += if let Some(n) = transaction_message.chain_id {
+            35 + n * 2
+        } else {
+            27
+        };
+
+        Transaction {
+            nonce: transaction_message.nonce,
+            gas_price: transaction_message.gas_price,
+            gas_limit: transaction_message.gas_limit,
+            action: transaction_message.action,
+            value: transaction_message.value,
+            input: transaction_message.input,
+            signature: TransactionSignature::new(
+                v,
+                H256::from_slice(&sig[..32]),
+                H256::from_slice(&sig[32..]),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn sk2addr(sk: &SecretKey) -> Address {
+        pk2addr(&PublicKey::from_secret_key(SECP256K1, &sk))
+    }
+
+    fn fixture() -> (Pool, Vec<SecretKey>) {
+        let s = repeat_with(|| SecretKey::new(&mut secp256k1::rand::thread_rng()))
+            .take(3)
+            .collect::<Vec<_>>();
+
+        let txs = vec![
+            TransactionMessage {
+                nonce: 0.into(),
+                gas_limit: 100000.into(),
+                gas_price: 100000.into(),
+                action: TransactionAction::Create,
+                value: 0.into(),
+                input: vec![],
+                chain_id: Some(CHAIN_ID),
+            },
+            TransactionMessage {
+                nonce: 1.into(),
+                gas_limit: 50000.into(),
+                gas_price: 50000.into(),
+                action: TransactionAction::Create,
+                value: 0.into(),
+                input: vec![],
+                chain_id: Some(CHAIN_ID),
+            },
+            TransactionMessage {
+                nonce: 2.into(),
+                gas_limit: 2000000.into(),
+                gas_price: 10000.into(),
+                action: TransactionAction::Create,
+                value: 0.into(),
+                input: vec![],
+                chain_id: Some(CHAIN_ID),
+            },
+        ];
+
+        let total_cost = txs.iter().fold(U256::zero(), |sum, tx| sum + cost(tx));
+
+        let base_state = hashmap! {
+            sk2addr(&s[0]) => AccountInfo {
+                nonce: 0,
+                balance: total_cost,
+            },
+            sk2addr(&s[1]) => AccountInfo {
+                nonce: 0,
+                balance: total_cost,
+            },
+            sk2addr(&s[2]) => AccountInfo {
+                nonce: 0,
+                balance: total_cost,
+            },
+        };
+
+        let mut pool = Pool::new();
+        pool.reset(Some(B_0));
+
+        for (&address, &state) in &base_state {
+            pool.add_account_state(address, state);
+        }
+
+        for sk in &s {
+            for tx in &txs {
+                let tx = sign_tx(sk, tx.clone());
+                let rich_tx = RichTransaction::try_from(tx.clone()).unwrap();
+                assert_eq!(rich_tx.sender, sk2addr(sk));
+                println!("signing and importing {}/{}", sk, rich_tx.hash);
+                assert!(pool.import_one(tx).unwrap());
+            }
+        }
+
+        (pool, s)
+    }
 
     #[test]
-    fn test_parse_transaction() {
+    fn parse_transaction() {
         let raw = hex!("f86e821d82850525dbd38082520894ce96e38eeff1c972f8f2851a7275b79b13b9a0498805e148839955f4008025a0ab1d3780cf338d1f86f42181ed13cd6c7fee7911a942c7583d36c9c83f5ec419a04984933928fac4b3242b9184aed633cc848f6a11d42af743f262ccf6592b8f71");
 
         let res = RichTransaction::try_from(rlp::decode::<Transaction>(&raw).unwrap()).unwrap();
@@ -500,6 +628,70 @@ mod tests {
         assert_eq!(
             &hex::encode(res.sender.as_bytes()),
             "3123c4396f1306678f382c186aee2dccce44f72c"
+        );
+    }
+
+    #[test]
+    fn basic() {
+        fixture();
+    }
+
+    #[test]
+    fn import_multiple() {
+        let (pool, sk) = fixture();
+
+        let mut new_pool = Pool::new();
+        new_pool.reset(pool.current_block());
+        for sk in sk {
+            let address = sk2addr(&sk);
+            assert!(new_pool.add_account_state(address, pool.account_state(address).unwrap()))
+        }
+
+        for res in new_pool.import_many(pool.pending_transactions().cloned()) {
+            assert!(res.unwrap())
+        }
+    }
+
+    #[test]
+    fn replace_transaction() {
+        let (mut pool, sk) = fixture();
+
+        let sk = &sk[0];
+
+        let mut new_pool_txs = pool
+            .pending_transactions_for_sender(sk2addr(sk))
+            .unwrap()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // No balance for this one
+        new_pool_txs.pop().unwrap();
+
+        let replaced_tx = new_pool_txs.pop().unwrap();
+
+        let replacement = sign_tx(
+            sk,
+            TransactionMessage {
+                nonce: replaced_tx.nonce,
+                gas_price: replaced_tx.gas_price + 1,
+                gas_limit: replaced_tx.gas_limit,
+                action: replaced_tx.action,
+                value: replaced_tx.value,
+                input: replaced_tx.input,
+                chain_id: Some(CHAIN_ID),
+            },
+        );
+
+        new_pool_txs.push(replacement.clone());
+
+        assert!(pool.import_one(replacement).unwrap());
+
+        assert_eq!(
+            new_pool_txs,
+            pool.pending_transactions_for_sender(sk2addr(sk))
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>()
         );
     }
 }
