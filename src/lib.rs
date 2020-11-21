@@ -71,8 +71,8 @@ impl TryFrom<Transaction> for RichTransaction {
 
 #[derive(Clone, Copy, Debug)]
 pub struct BlockHeader {
-    hash: H256,
-    parent: H256,
+    pub hash: H256,
+    pub parent: H256,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
