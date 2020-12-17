@@ -75,7 +75,7 @@ pub struct BlockHeader {
     pub parent: H256,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccountInfo {
     pub balance: U256,
     pub nonce: u64,
@@ -285,10 +285,10 @@ impl Pool {
             },
         );
 
-        for (_, account_txs) in txs {
+        for (_sender, account_txs) in txs {
             let mut chain_error = false;
             let mut no_state = None;
-            for (_, (idx, tx)) in account_txs {
+            for (_nonce, (idx, tx)) in account_txs {
                 out[idx] = {
                     if chain_error {
                         Err({
@@ -380,7 +380,7 @@ impl Pool {
 
         if block.parent != current_block.hash {
             bail!(
-                "block gap detected: attemped to apply {} which is not child of {}",
+                "block gap detected: attempted to apply {} which is not child of {}",
                 block.parent,
                 current_block.hash
             );
@@ -403,6 +403,8 @@ impl Pool {
                             }
                         }
 
+                        // update info
+                        pool.info = new_info;
                         // More expensive tx could have squeezed in - we have to recheck our balance.
                         for tx in pool.prune_insufficient_balance(None) {
                             assert!(self.by_hash.remove(&tx.hash).is_some());
@@ -514,6 +516,15 @@ mod tests {
         )),
     };
 
+    const B_1: BlockHeader = BlockHeader {
+        parent: H256(hex!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )),
+        hash: H256(hex!(
+            "1000000000000000000000000000000000000000000000000000000000000000"
+        )),
+    };
+
     fn cost(tx: &TransactionMessage) -> U256 {
         tx.gas_limit * tx.gas_price + tx.value
     }
@@ -590,20 +601,15 @@ mod tests {
         ];
 
         let total_cost = txs.iter().fold(U256::zero(), |sum, tx| sum + cost(tx));
+        let base_account_info = AccountInfo {
+            nonce: 0,
+            balance: total_cost,
+        };
 
         let base_state = hashmap! {
-            sk2addr(&s[0]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
-            sk2addr(&s[1]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
-            sk2addr(&s[2]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
+            sk2addr(&s[0]) => base_account_info.clone(),
+            sk2addr(&s[1]) => base_account_info.clone(),
+            sk2addr(&s[2]) => base_account_info.clone(),
         };
 
         let mut pool = Pool::new();
@@ -654,8 +660,8 @@ mod tests {
 
         let mut new_pool = Pool::new();
         new_pool.reset(pool.current_block());
-        for sk in sk {
-            let address = sk2addr(&sk);
+        for sk in &sk {
+            let address = sk2addr(sk);
             assert!(new_pool.add_account_state(address, pool.account_state(address).unwrap()))
         }
 
@@ -705,5 +711,36 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn apply_block() {
+        let (mut pool, sk) = fixture();
+
+        let mut pool_txs = pool
+            .pending_transactions_for_sender(sk2addr(&sk[0]))
+            .unwrap()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let remain_tx: Transaction = pool_txs.pop().unwrap();
+
+        let new_info = AccountInfo {
+            nonce: 2,
+            balance: cost(&remain_tx.into()),
+        };
+        let account_diff = AccountDiff::Changed(new_info);
+        let account_diff = hashmap! {
+            sk2addr(&sk[0]) => account_diff.clone(),
+            sk2addr(&sk[1]) => account_diff.clone(),
+            sk2addr(&sk[2]) => account_diff.clone(),
+        };
+
+        pool.apply_block(B_1, account_diff);
+
+        for sk in &sk {
+            let address = sk2addr(sk);
+            assert_eq!(pool.account_state(address).unwrap(), new_info);
+        }
     }
 }
