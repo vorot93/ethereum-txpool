@@ -75,7 +75,7 @@ pub struct BlockHeader {
     pub parent: H256,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccountInfo {
     pub balance: U256,
     pub nonce: u64,
@@ -285,10 +285,10 @@ impl Pool {
             },
         );
 
-        for (_, account_txs) in txs {
+        for (_sender, account_txs) in txs {
             let mut chain_error = false;
             let mut no_state = None;
-            for (_, (idx, tx)) in account_txs {
+            for (_nonce, (idx, tx)) in account_txs {
                 out[idx] = {
                     if chain_error {
                         Err({
@@ -370,7 +370,7 @@ impl Pool {
     fn apply_block_inner(
         &mut self,
         block: BlockHeader,
-        account_diffs: HashMap<Address, AccountDiff>,
+        account_diffs: &HashMap<Address, AccountDiff>,
     ) -> anyhow::Result<()> {
         let current_block = if let Some(b) = self.block {
             b
@@ -380,7 +380,7 @@ impl Pool {
 
         if block.parent != current_block.hash {
             bail!(
-                "block gap detected: attemped to apply {} which is not child of {}",
+                "block gap detected: attempted to apply {} which is not child of {}",
                 block.parent,
                 current_block.hash
             );
@@ -388,7 +388,7 @@ impl Pool {
 
         for (address, account_diff) in account_diffs {
             // Only do something if we actually have pool for this sender.
-            if let Occupied(mut address_entry) = self.by_sender.entry(address) {
+            if let Occupied(mut address_entry) = self.by_sender.entry(*address) {
                 match account_diff {
                     AccountDiff::Changed(new_info) => {
                         let pool = address_entry.get_mut();
@@ -403,6 +403,8 @@ impl Pool {
                             }
                         }
 
+                        // update info
+                        pool.info = *new_info;
                         // More expensive tx could have squeezed in - we have to recheck our balance.
                         for tx in pool.prune_insufficient_balance(None) {
                             assert!(self.by_hash.remove(&tx.hash).is_some());
@@ -429,7 +431,7 @@ impl Pool {
     pub fn apply_block(
         &mut self,
         block: BlockHeader,
-        account_diffs: HashMap<Address, AccountDiff>,
+        account_diffs: &HashMap<Address, AccountDiff>,
     ) {
         if let Err(e) = self.apply_block_inner(block, account_diffs) {
             warn!(
@@ -514,6 +516,15 @@ mod tests {
         )),
     };
 
+    const B_1: BlockHeader = BlockHeader {
+        parent: H256(hex!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )),
+        hash: H256(hex!(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        )),
+    };
+
     fn cost(tx: &TransactionMessage) -> U256 {
         tx.gas_limit * tx.gas_price + tx.value
     }
@@ -590,20 +601,15 @@ mod tests {
         ];
 
         let total_cost = txs.iter().fold(U256::zero(), |sum, tx| sum + cost(tx));
+        let base_account_info = AccountInfo {
+            nonce: 0,
+            balance: total_cost,
+        };
 
         let base_state = hashmap! {
-            sk2addr(&s[0]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
-            sk2addr(&s[1]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
-            sk2addr(&s[2]) => AccountInfo {
-                nonce: 0,
-                balance: total_cost,
-            },
+            sk2addr(&s[0]) => base_account_info,
+            sk2addr(&s[1]) => base_account_info,
+            sk2addr(&s[2]) => base_account_info,
         };
 
         let mut pool = Pool::new();
@@ -654,8 +660,8 @@ mod tests {
 
         let mut new_pool = Pool::new();
         new_pool.reset(pool.current_block());
-        for sk in sk {
-            let address = sk2addr(&sk);
+        for sk in &sk {
+            let address = sk2addr(sk);
             assert!(new_pool.add_account_state(address, pool.account_state(address).unwrap()))
         }
 
@@ -705,5 +711,39 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn apply_block() {
+        let (mut pool, sk) = fixture();
+
+        let mut account_infos = HashMap::new();
+        for sk in &sk {
+            let mut pool_txs = pool
+                .pending_transactions_for_sender(sk2addr(sk))
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let last_tx: Transaction = pool_txs.pop().unwrap();
+
+            let new_info = AccountInfo {
+                nonce: last_tx.nonce.as_u64().checked_sub(1).unwrap_or_default(),
+                balance: cost(&last_tx.into()),
+            };
+            account_infos.insert(sk2addr(sk), new_info);
+        }
+
+        pool.apply_block(
+            B_1,
+            &account_infos
+                .iter()
+                .map(|(&addr, &state)| (addr, AccountDiff::Changed(state)))
+                .collect(),
+        );
+
+        for (address, new_info) in account_infos {
+            assert_eq!(pool.account_state(address).unwrap(), new_info);
+        }
     }
 }
