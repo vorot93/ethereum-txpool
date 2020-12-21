@@ -370,7 +370,7 @@ impl Pool {
     fn apply_block_inner(
         &mut self,
         block: BlockHeader,
-        account_diffs: HashMap<Address, AccountDiff>,
+        account_diffs: &HashMap<Address, AccountDiff>,
     ) -> anyhow::Result<()> {
         let current_block = if let Some(b) = self.block {
             b
@@ -388,7 +388,7 @@ impl Pool {
 
         for (address, account_diff) in account_diffs {
             // Only do something if we actually have pool for this sender.
-            if let Occupied(mut address_entry) = self.by_sender.entry(address) {
+            if let Occupied(mut address_entry) = self.by_sender.entry(*address) {
                 match account_diff {
                     AccountDiff::Changed(new_info) => {
                         let pool = address_entry.get_mut();
@@ -404,7 +404,7 @@ impl Pool {
                         }
 
                         // update info
-                        pool.info = new_info;
+                        pool.info = *new_info;
                         // More expensive tx could have squeezed in - we have to recheck our balance.
                         for tx in pool.prune_insufficient_balance(None) {
                             assert!(self.by_hash.remove(&tx.hash).is_some());
@@ -431,7 +431,7 @@ impl Pool {
     pub fn apply_block(
         &mut self,
         block: BlockHeader,
-        account_diffs: HashMap<Address, AccountDiff>,
+        account_diffs: &HashMap<Address, AccountDiff>,
     ) {
         if let Err(e) = self.apply_block_inner(block, account_diffs) {
             warn!(
@@ -521,7 +521,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000"
         )),
         hash: H256(hex!(
-            "1000000000000000000000000000000000000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000001"
         )),
     };
 
@@ -607,9 +607,9 @@ mod tests {
         };
 
         let base_state = hashmap! {
-            sk2addr(&s[0]) => base_account_info.clone(),
-            sk2addr(&s[1]) => base_account_info.clone(),
-            sk2addr(&s[2]) => base_account_info.clone(),
+            sk2addr(&s[0]) => base_account_info,
+            sk2addr(&s[1]) => base_account_info,
+            sk2addr(&s[2]) => base_account_info,
         };
 
         let mut pool = Pool::new();
@@ -717,29 +717,32 @@ mod tests {
     fn apply_block() {
         let (mut pool, sk) = fixture();
 
-        let mut pool_txs = pool
-            .pending_transactions_for_sender(sk2addr(&sk[0]))
-            .unwrap()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let remain_tx: Transaction = pool_txs.pop().unwrap();
-
-        let new_info = AccountInfo {
-            nonce: 2,
-            balance: cost(&remain_tx.into()),
-        };
-        let account_diff = AccountDiff::Changed(new_info);
-        let account_diff = hashmap! {
-            sk2addr(&sk[0]) => account_diff.clone(),
-            sk2addr(&sk[1]) => account_diff.clone(),
-            sk2addr(&sk[2]) => account_diff.clone(),
-        };
-
-        pool.apply_block(B_1, account_diff);
-
+        let mut account_infos = HashMap::new();
         for sk in &sk {
-            let address = sk2addr(sk);
+            let mut pool_txs = pool
+                .pending_transactions_for_sender(sk2addr(sk))
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let last_tx: Transaction = pool_txs.pop().unwrap();
+
+            let new_info = AccountInfo {
+                nonce: last_tx.nonce.as_u64().checked_sub(1).unwrap_or_default(),
+                balance: cost(&last_tx.into()),
+            };
+            account_infos.insert(sk2addr(sk), new_info);
+        }
+
+        pool.apply_block(
+            B_1,
+            &account_infos
+                .iter()
+                .map(|(&addr, &state)| (addr, AccountDiff::Changed(state)))
+                .collect(),
+        );
+
+        for (address, new_info) in account_infos {
             assert_eq!(pool.account_state(address).unwrap(), new_info);
         }
     }
