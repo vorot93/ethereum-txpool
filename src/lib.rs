@@ -43,7 +43,7 @@ impl TryFrom<Transaction> for RichTransaction {
         let h = {
             let mut stream = RlpStream::new();
             tx.rlp_append(&mut stream);
-            Keccak256::digest(&stream.drain())
+            Keccak256::digest(&stream.out())
         };
         let hash = H256::from_slice(h.as_slice());
 
