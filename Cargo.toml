@@ -7,11 +7,11 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"
-ethereum = { version = "0.5", default-features = false }
-ethereum-types = "0.9"
+ethereum = { version = "0.7", default-features = false }
+ethereum-types = "0.11"
 thiserror = "1"
-rlp = "0.4"
-secp256k1 = { version = "0.19", features = ["global-context", "rand-std", "recovery"] }
+rlp = "0.5"
+secp256k1 = { version = "0.20", features = ["global-context", "recovery"] }
 sha3 = "0.9"
 tracing = "0.1"
 
