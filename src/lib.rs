@@ -14,7 +14,7 @@ use std::{
         hash_map::Entry::{Occupied, Vacant},
         BTreeMap, HashMap, VecDeque,
     },
-    convert::TryFrom,
+    convert::{TryFrom, TryInto},
     sync::Arc,
 };
 use thiserror::Error;
@@ -24,6 +24,8 @@ struct RichTransaction {
     inner: Transaction,
     sender: Address,
     hash: H256,
+    // temporary crutch
+    nonce: u64,
 }
 
 impl RichTransaction {
@@ -64,6 +66,10 @@ impl TryFrom<Transaction> for RichTransaction {
         Ok(Self {
             sender: pk2addr(public),
             hash,
+            nonce: tx
+                .nonce
+                .try_into()
+                .map_err(|e| anyhow!("invalid nonce: {}", e))?,
             inner: tx,
         })
     }
@@ -188,7 +194,7 @@ impl Pool {
                     .get_mut(&tx.sender)
                     .ok_or(ImportError::NoState(tx.sender))?;
 
-                if let Some(offset) = tx.inner.nonce.as_u64().checked_sub(account_pool.info.nonce) {
+                if let Some(offset) = tx.nonce.checked_sub(account_pool.info.nonce) {
                     // This transaction's nonce is account nonce or greater.
                     if offset <= account_pool.txs.len() as u64 {
                         // This transaction is between existing txs in the pool, or right the next one.
@@ -215,7 +221,7 @@ impl Pool {
                             *pooled_tx = tx;
                         } else {
                             // Not a replacement transaction.
-                            assert_eq!(tx.inner.nonce, U256::from(account_pool.txs.len()));
+                            assert_eq!(tx.nonce, account_pool.txs.len() as u64);
 
                             tx_by_hash_entry.insert(tx.clone());
                             account_pool.txs.push_back(tx);
@@ -255,7 +261,7 @@ impl Pool {
         let mut out = vec![];
 
         let txs = txs.enumerate().fold(
-            HashMap::<Address, BTreeMap<U256, (usize, RichTransaction)>>::new(),
+            HashMap::<Address, BTreeMap<u64, (usize, RichTransaction)>>::new(),
             |mut txs, (idx, tx)| {
                 out.push(Ok(false));
                 match RichTransaction::try_from(tx) {
@@ -264,7 +270,7 @@ impl Pool {
                         txs
                     }
                     Ok(tx) => {
-                        match txs.entry(tx.sender).or_default().entry(tx.inner.nonce) {
+                        match txs.entry(tx.sender).or_default().entry(tx.nonce) {
                             std::collections::btree_map::Entry::Vacant(entry) => {
                                 entry.insert((idx, tx));
                             }
